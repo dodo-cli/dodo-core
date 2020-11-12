@@ -9,18 +9,6 @@ message ContainerId {
   string id = 1;
 }
 
-message ContainerBox {
-  string id = 1;
-  uint32 height = 2;
-  uint32 width = 3;
-}
-
-message ContainerConfig {
-  Backdrop config = 1;
-  bool tty = 2;
-  bool stdio = 3;
-}
-
 message Backdrop {
   string name = 1;
   repeated string aliases = 2;
@@ -59,22 +47,16 @@ message Volume {
 }
 
 message Device {
-  string cgroup_rule = 1;
-  string source = 2;
-  string target = 3;
-  string permissions = 4;
+  string source = 1;
+  string target = 2;
+  string permissions = 3;
 }
 
 message Port {
-  string target = 1;
-  string published = 2;
+  int32 target = 1;
+  int32 published = 2;
   string protocol = 3;
   string host_ip = 4;
-}
-
-message Image {
-  string name = 1;
-  string id = 2;
 }
 
 message Result {
@@ -82,23 +64,8 @@ message Result {
   string message = 2;
 }
 
-message StreamingConnection {
-  string url = 1;
-}
-
 service Configuration {
   rpc Init(Empty) returns (Empty);
   rpc UpdateConfiguration(Backdrop) returns (Backdrop);
   rpc Provision(ContainerId) returns (Empty);
-}
-
-service ContainerRuntime {
-  rpc Init(Empty) returns (Empty);
-  rpc ResolveImage(Image) returns (Image);
-  rpc CreateContainer(ContainerConfig) returns (ContainerId);
-  rpc StartContainer(ContainerId) returns (Empty);
-  rpc RemoveContainer(ContainerId) returns (Empty);
-  rpc ResizeContainer(ContainerBox) returns (Empty);
-  rpc SetupStreamingConnection(ContainerId) returns (StreamingConnection);
-  rpc StreamContainer(ContainerBox) returns (Result);
 }

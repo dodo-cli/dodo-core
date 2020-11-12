@@ -11,8 +11,17 @@ import (
 )
 
 const (
-	systemAppDir = "/var/lib/dodo"
+	systemAppDir       = "/var/lib/dodo"
+	defaultCRIEndpoint = "/run/containerd/containerd.sock"
 )
+
+func GetCRIEndpoint() string {
+	if endpoint := os.Getenv("DODO_CRI_ENDPOINT"); endpoint != "" {
+		return endpoint
+	}
+
+	return defaultCRIEndpoint
+}
 
 func GetAppDir() string {
 	dir := filepath.FromSlash(systemAppDir)

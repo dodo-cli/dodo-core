@@ -43,7 +43,6 @@ func DecodeDevice(target interface{}) decoder.Decoding {
 
 	return decoder.Kinds(map[reflect.Kind]decoder.Decoding{
 		reflect.Map: decoder.Keys(map[string]decoder.Decoding{
-			"cgroup_rule": decoder.String(&dev.CgroupRule),
 			"source":      decoder.String(&dev.Source),
 			"target":      decoder.String(&dev.Target),
 			"permissions": decoder.String(&dev.Permissions),

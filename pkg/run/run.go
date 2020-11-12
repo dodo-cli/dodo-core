@@ -2,18 +2,25 @@ package run
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"syscall"
+	"time"
 
 	"github.com/dodo-cli/dodo-core/pkg/plugin"
 	"github.com/dodo-cli/dodo-core/pkg/plugin/configuration"
-	"github.com/dodo-cli/dodo-core/pkg/plugin/runtime"
+	"github.com/dodo-cli/dodo-core/pkg/runtime"
 	"github.com/dodo-cli/dodo-core/pkg/types"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/moby/term"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 func RunContainer(overrides *types.Backdrop) error {
@@ -28,23 +35,49 @@ func RunContainer(overrides *types.Backdrop) error {
 		config.ContainerName = fmt.Sprintf("%s-%s", config.Name, hex.EncodeToString(id))
 	}
 
-	rt, err := GetRuntime()
+	rt, err := runtime.NewClient()
 	if err != nil {
 		return err
 	}
 
-	imageID, err := rt.ResolveImage(config.ImageId)
+	imageID, err := rt.PullImage(
+		&runtimeapi.ImageSpec{Image: config.ImageId},
+		&runtimeapi.AuthConfig{},
+		&runtimeapi.PodSandboxConfig{},
+	)
 	if err != nil {
 		return err
 	}
 
 	config.ImageId = imageID
 
-	tty := term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
+	randomID := make([]byte, 20)
+	if _, err := rand.Read(randomID); err != nil {
+		return err
+	}
 
-	containerID, err := rt.CreateContainer(config, tty, true)
+	tty := term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd())
+	tmpPath := fmt.Sprintf("/tmp/dodo-%s/", hex.EncodeToString(randomID))
+	sandboxConfig, containerConfig := config.RuntimeConfig(tmpPath, tty, true)
+
+	sandboxID, err := rt.RunPodSandbox(sandboxConfig, "")
 	if err != nil {
 		return err
+	}
+
+	containerID, err := rt.CreateContainer(sandboxID, containerConfig, sandboxConfig)
+	if err != nil {
+		return err
+	}
+
+	if len(config.Entrypoint.Script) > 0 {
+		encoded := base64.StdEncoding.EncodeToString([]byte(config.Entrypoint.Script + "\n"))
+		script := fmt.Sprintf("echo %s | base64 -d > %s", encoded, path.Join(tmpPath, "entrypoint"))
+
+		_, stderr, err := rt.ExecSync(containerID, []string{"/bin/sh", "-c", script}, 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("%s: %w", stderr, err)
+		}
 	}
 
 	for _, p := range plugin.GetPlugins(configuration.Type.String()) {
@@ -54,50 +87,63 @@ func RunContainer(overrides *types.Backdrop) error {
 		}
 	}
 
-	var height, width uint32
+	resp, err := rt.Attach(&runtimeapi.AttachRequest{
+		ContainerId: containerID,
+		Tty:         tty,
+		Stdin:       true,
+		Stdout:      true,
+		Stderr:      true,
+	})
+	if err != nil {
+		return err
+	}
+
+	attachURL, err := url.Parse(resp.Url)
+	if err != nil {
+		return err
+	}
+
+	executor, err := remotecommand.NewSPDYExecutor(
+		&rest.Config{},
+		"POST",
+		attachURL,
+	)
+	if err != nil {
+		return err
+	}
+
+	opts := remotecommand.StreamOptions{
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+		Tty:    tty,
+	}
 
 	fd := os.Stdin.Fd()
 	if term.IsTerminal(fd) {
-		state, err := term.SetRawTerminal(fd)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			if err := term.RestoreTerminal(fd, state); err != nil {
-				log.L().Error("could not restore terminal", "error", err)
-			}
-		}()
-
-		ws, err := term.GetWinsize(fd)
-		if err != nil {
-			return err
-		}
-
-		height = uint32(ws.Height)
-		width = uint32(ws.Width)
-
-		resizeChannel := make(chan os.Signal, 1)
-		signal.Notify(resizeChannel, syscall.SIGWINCH)
+		resizeChannel := make(chan *remotecommand.TerminalSize)
+		winch := make(chan os.Signal, 1)
+		signal.Notify(winch, syscall.SIGWINCH)
 
 		go func() {
-			for range resizeChannel {
-				resize(fd, rt, containerID)
+			for range winch {
+				ws, err := term.GetWinsize(fd)
+				if err != nil {
+					continue
+				}
+
+				if ws.Height == 0 && ws.Width == 0 {
+					continue
+				}
+
+				resizeChannel <- &remotecommand.TerminalSize{Height: ws.Height, Width: ws.Width}
 			}
 		}()
+
+		opts.TerminalSizeQueue = &resizer{resizeChannel: resizeChannel}
 	}
 
-	return rt.StreamContainer(containerID, os.Stdin, os.Stdout, height, width)
-}
-
-func GetRuntime() (runtime.ContainerRuntime, error) {
-	for _, p := range plugin.GetPlugins(runtime.Type.String()) {
-		if rt, ok := p.(runtime.ContainerRuntime); ok {
-			return rt, nil
-		}
-	}
-
-	return nil, fmt.Errorf("could not find container runtime: %w", plugin.ErrNoValidPluginFound)
+	return executor.Stream(opts)
 }
 
 func GetConfig(overrides *types.Backdrop) *types.Backdrop {
@@ -118,20 +164,10 @@ func GetConfig(overrides *types.Backdrop) *types.Backdrop {
 	return config
 }
 
-func resize(fd uintptr, rt runtime.ContainerRuntime, containerID string) {
-	ws, err := term.GetWinsize(fd)
-	if err != nil {
-		return
-	}
+type resizer struct {
+	resizeChannel chan *remotecommand.TerminalSize
+}
 
-	height := uint32(ws.Height)
-	width := uint32(ws.Width)
-
-	if height == 0 && width == 0 {
-		return
-	}
-
-	if err := rt.ResizeContainer(containerID, height, width); err != nil {
-		log.L().Warn("could not resize terminal", "error", err)
-	}
+func (r *resizer) Next() *remotecommand.TerminalSize {
+	return <-r.resizeChannel
 }
